@@ -56,4 +56,4 @@ The pipeline will format data, upload it as a file in a Nextcloud instance, and 
   ![image](https://github.com/user-attachments/assets/34ebd620-b31c-4b0f-8110-31b849dca741)
 
 - Finally, you just have to go to your backup jobs or whatever jobs in Proxmox, and set the Notification Mode to "Notification System".
-- Now, test all of this at once, 
+- Now, test all of this at once, by running a backup job from Datacenter -> Backup. Select your job and click "Run now". For testing purposes, just create a job that makes a snapshot of a LXC container so it's quick. 
