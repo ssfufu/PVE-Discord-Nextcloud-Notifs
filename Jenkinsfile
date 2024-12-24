@@ -1,150 +1,137 @@
 pipeline {
     agent any
     parameters {
-        string(name: 'X_STATE', defaultValue: '', description: 'Backup state')
-        string(name: 'X_LOG_CONTENT', defaultValue: 'If you are reading this outside of Jenkins, something went wrong', description: 'Log content received from Proxmox')
-        string(name: 'X_FQDN', defaultValue: '', description: 'FQDN of the Nextcloud server')
-        string(name: 'X_USER', defaultValue: '', description: 'Nextcloud username')
-        string(name: 'X_PASSWORD', defaultValue: '', description: 'Nextcloud user password')
-        string(name: 'X_DISCORD_WEBHOOK', defaultValue: '', description: 'Discord webhook')
-        string(name: 'X_TYPE', defaultValue: '', description: 'Type of action')
-        string(name: 'X_HOST', defaultValue: '', description: 'Hostname of the Proxmox server')
-        string(name: 'X_FORMATTED_TIMESTAMP', defaultValue: '', description: 'Backup timestamp')
+        string(name: 'X_STATE', defaultValue: '', description: 'Etat de la backup')
+        string(name: 'X_LOG_CONTENT', defaultValue: 'Si tu lis ca, alors ca a foire quelque part', description: 'Contenu des logs recu depuis Proxmox')
+        string(name: 'X_FQDN', defaultValue: '', description: 'FQDN du serveur Nextcloud')
+        string(name: 'X_USER', defaultValue: '', description: 'Nom d utilisateur Nextcloud')
+        string(name: 'X_PASSWORD', defaultValue: '', description: 'Mot de passe de l utilisateur Nextcloud')
+        string(name: 'X_DISCORD_WEBHOOK', defaultValue: '', description: 'Webhook Discord')
+        string(name: 'X_TYPE', defaultValue: '', description: 'Type d action')
+        string(name: 'X_HOST', defaultValue: '', description: 'Nom d hote du serveur Proxmox')
+        string(name: 'X_FORMATTED_TIMESTAMP', defaultValue: '', description: 'Timestamp de la backup')
     }
 
     stages {
-        stage('Initialization') {
+        stage ('Initialisation') {
             steps {
                 script {
-                    echo "Initialization"
-
-                    // This timestamp will be used for the name of the log file.
+                    echo "Initialisation"
+                    
                     def timestamp = new Date().format("yyyy-MM-dd_HH-mm-ss", TimeZone.getTimeZone('UTC'))
                     env.X_BACKUP_TIMESTAMP = timestamp
-
-                    // Here I format the time for my needs, it's the one displayed in the Discord message.
                     def formattedTimestamp = new Date().format("dd/MM/yyyy", TimeZone.getTimeZone('UTC'))
                     env.X_FORMATTED_TIMESTAMP = formattedTimestamp
 
-                    echo "Generated timestamp: ${env.X_BACKUP_TIMESTAMP}"
+                    echo "Timestamp genere : ${env.X_BACKUP_TIMESTAMP}"
                     echo "${params.X_STATE} ${params.X_TYPE} ${env.X_BACKUP_TIMESTAMP} ${params.X_HOST} ${params.X_FQDN} ${params.X_USER} ${params.X_PASSWORD} ${params.X_DISCORD_WEBHOOK}"
                 }
             }
         }
-        stage('Save logs locally') {
+        stage('Sauvegarder les logs localement') {
             steps {
                 script {
-                    echo "Saving logs locally"
+                    echo "Sauvegarde locale des logs"
                     if (!params.X_LOG_CONTENT || params.X_LOG_CONTENT.trim().isEmpty()) {
-                        error "Logs are empty or have not been received."
+                        error "Les logs sont vides ou n ont pas été recus."
                     }
-
-                    // Creating the log file in the local workspace. (It will be removed at the end of the job).
-                    def logFileName = "${params.X_TYPE}-log-${env.X_BACKUP_TIMESTAMP}.log"
+                    
+                    def logFileName = "backup-log-${env.X_BACKUP_TIMESTAMP}.log"
                     writeFile file: logFileName, text: params.X_LOG_CONTENT
                     env.LOG_FILE = logFileName
-                    echo "File saved locally: ${logFileName}"
+                    echo "Fichier sauvegarde localement : ${logFileName}"
                 }
             }
         }
-        stage('Upload to Nextcloud') {
+        stage('Uploader vers Nextcloud') {
             steps {
                 script {
-                    
-                    echo "Uploading logs to Nextcloud"
+                    echo "Upload des logs vers Nextcloud"
                     if (!params.X_FQDN || !params.X_USER || !params.X_PASSWORD) {
-                        error "Nextcloud parameters (FQDN, username, password) are not defined."
+                        error "Les parametres Nextcloud (FQDN, utilisateur, mot de passe) ne sont pas definis."
                     }
                     
                     def nextcloudURL = "https://${params.X_FQDN}/remote.php/dav/files/${params.X_USER}/BACKUP-LOGS/${env.LOG_FILE}"
-                  
-                    // This works, but it lacks the option to hide the user and password in the Jenkins job logs.
-                    // It might also need some retries in case the Nextcloud server is unavailable for a few seconds/minutes/hours/etc.
                     sh """
                     curl -u ${params.X_USER}:${params.X_PASSWORD} -T ./${env.LOG_FILE} ${nextcloudURL}
                     """
                     
                     env.PROTECTED_URL = nextcloudURL
-                    echo "File uploaded successfully: ${env.PROTECTED_URL}"
+                    echo "Fichier uploade avec succès : ${env.PROTECTED_URL}"
                 }
             }
         }
-        stage('Send link to Discord') {
+        stage('Envoyer le lien a Discord') {
             steps {
                 script {
-                    echo "Sending link to Discord"
+                    echo "Envoi du lien vers Discord"
                     if (!params.X_DISCORD_WEBHOOK) {
-                        error "Discord webhook is not defined."
+                        error "Le webhook Discord n est pas defini."
                     }
-                  
-                    // Not sure about the usage of the two next switch/case.
-                    // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.  
+                    
                     def actionType = ""
                     switch(params.X_TYPE) {
                         case "package-updates":
-                            actionType = "Package updates"
+                            actionType = "La mise a jour des paquets"
                             break
                         case "prune":
-                            actionType = "Pruning"
+                            actionType = "Le nettoyage"
                             break
                         case "gc":
-                            actionType = "Garbage collection"
+                            actionType = "Le garbage collection"
                             break
                         case "verification":
-                            actionType = "Verification"
+                            actionType = "La verification"
                             break
                         case "vzdump":
-                            actionType = "Backup"
+                            actionType = "La sauvegarde"
                             break
                         default:
-                            actionType = "Action"
+                            actionType = "L action"
                         break
                     }
 
-                    // Creating the first part of the Discord message, which content's different by reading the <severity> variable sent by the PVE or PBS. 
                     switch(params.X_STATE) {
                         case "info":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} was successfully completed."
+                            stateMessage = "${actionType} du ${params.X_HOST} en date du ${env.X_FORMATTED_TIMESTAMP} a été effectuée avec succès."
                             break
                         case "error":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} failed."
+                            stateMessage = "${actionType} du ${params.X_HOST} en date du ${env.X_FORMATTED_TIMESTAMP} a échoué."
                             break
                         case "notice":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} completed with errors."
+                            stateMessage = "${actionType} du ${params.X_HOST} en date du ${env.X_FORMATTED_TIMESTAMP} a été effectuée avec des erreurs."
                             break
                         case "warning":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} completed with warnings."
+                            stateMessage = "${actionType} du ${params.X_HOST} en date du ${env.X_FORMATTED_TIMESTAMP} a été effectuée avec des avertissements."
                             break
                         case "unknown":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} has an unknown state: ${params.X_STATE}"
+                            stateMessage = "${actionType} du ${params.X_HOST} en date du ${env.X_FORMATTED_TIMESTAMP} a un état inconnu : ${params.X_STATE}"
                             break
                         default:
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} has an unrecognized state (default message): ${params.X_STATE}"
+                            stateMessage = "${actionType} du ${params.X_HOST} en date du ${env.X_FORMATTED_TIMESTAMP} a un état non reconnu (msg par défaut): ${params.X_STATE}"
                             break
                     }
 
-                    // Second part of the Discord message, it contains the URL to download the log file (protected by the basic authentication module of Nextcloud).
-                    def logMessage = "The log file is available here: ${env.PROTECTED_URL}"
+                    def logMessage = "Le fichier de log est disponible ici : ${env.PROTECTED_URL}"
 
-                    // Assembly of the Discord message.
                     def discordMessage = groovy.json.JsonOutput.toJson([
                         content: "${stateMessage} ${logMessage}"
                     ])
 
-                    echo "Message for Discord: ${discordMessage}"
+                    echo "Message pour Discord : ${discordMessage}"
                     sh """
                     curl -H "Content-Type: application/json" -X POST \
                     -d '${discordMessage}' \
                     ${params.X_DISCORD_WEBHOOK}
                     """
-                    echo "Message successfully sent to Discord."
+                    echo "Message envoye a Discord avec succès."
                 }
             }
         }
     }
     post {
         always {
-            echo "Pipeline completed"
+            echo "Pipeline termine"
             cleanWs()
         }
     }
