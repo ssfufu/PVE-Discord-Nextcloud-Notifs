@@ -1,6 +1,6 @@
 ## Proxmox notifications sender via webhook, Jenkins and Nextcloud.
 
-#### DISCLAIMER: I am NOT an expert Jenkins user, algorithmic or wrong usage of Groovy might be present in the Jenkinsfile. Also, I am doing this on my spare time and my doc writing skills may not be so good.
+#### DISCLAIMER: I am NOT an expert Jenkins user, wrong usage of Groovy might be present in the Jenkinsfile. Also, I am doing this on my spare time and my doc writing skills may not be so good.
 
 #### Why does this project exist ?
 I have multiple backup jobs that include multiple VMs. I wanted to use the new Webhook feature in the Proxmox notifications released in v8.3. The issue is that Discord only allows up to 2000 characters in the body of the request, and my logs are actually more than 40K.
