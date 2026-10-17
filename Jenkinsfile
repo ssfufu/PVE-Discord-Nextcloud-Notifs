@@ -27,7 +27,7 @@ pipeline {
     parameters {
         // Filled by the webhook, or by hand to test the job.
         string(name: 'X_STATE', defaultValue: '', description: 'Severity: info, notice, warning, error or unknown')
-        string(name: 'X_TYPE', defaultValue: '', description: 'Notification type: vzdump, package-updates, gc, prune, verify...')
+        string(name: 'X_TYPE', defaultValue: '', description: 'Type: vzdump, package-updates, gc, prune, verify...')
         string(name: 'X_HOST', defaultValue: '', description: 'Name of the Proxmox server')
         string(name: 'X_TITLE', defaultValue: '', description: 'Notification title (optional)')
         string(name: 'X_TIMESTAMP', defaultValue: '', description: 'Notification time as a Unix timestamp (optional)')
@@ -59,7 +59,7 @@ pipeline {
             steps {
                 script {
                     if (!params.X_LOG_CONTENT?.trim()) {
-                        error "The notification body is empty."
+                        error 'The notification body is empty'
                     }
 
                     // Values come from the webhook body: only keep safe characters,
@@ -79,7 +79,8 @@ pipeline {
                     env.LOG_FILE = "${env.NOTIF_HOST}_${env.NOTIF_TYPE}_${date.format('yyyy-MM-dd_HH-mm-ss', utc)}.log"
                     writeFile file: env.LOG_FILE, text: params.X_LOG_CONTENT
 
-                    echo "Notification: ${env.NOTIF_TYPE} (${env.NOTIF_STATE}) from ${env.NOTIF_HOST}, log file ${env.LOG_FILE}"
+                    echo "Notification: ${env.NOTIF_TYPE} (${env.NOTIF_STATE}) from ${env.NOTIF_HOST}"
+                    echo "Log file: ${env.LOG_FILE}"
                 }
             }
         }
@@ -88,12 +89,12 @@ pipeline {
                 // A Nextcloud failure must not prevent the Discord notification.
                 catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     script {
-                        echo "Uploading logs to Nextcloud"
+                        echo 'Uploading the log to Nextcloud'
                         withCredentials([usernamePassword(credentialsId: env.NEXTCLOUD_CREDENTIALS,
                                                           usernameVariable: 'NC_USER', passwordVariable: 'NC_PASS')]) {
                             def base = env.NEXTCLOUD_URL.replaceAll('/+$', '')
                             if (!base.startsWith('https://')) {
-                                error "NEXTCLOUD_URL must start with https://"
+                                error 'NEXTCLOUD_URL must start with https://'
                             }
                             def davRoot = "${base}/remote.php/dav/files/${urlEncode(env.NC_USER)}"
                             def folder = davPath(env.NEXTCLOUD_FOLDER)
@@ -116,7 +117,8 @@ pipeline {
                                     IFS=/
                                     for part in $NC_FOLDER; do
                                         url="$url/$part"
-                                        code=$(dav --output /dev/null --write-out '%{http_code}' --request MKCOL "$url/")
+                                        code=$(dav --request MKCOL --output /dev/null \\
+                                            --write-out '%{http_code}' "$url/")
                                         case $code in
                                             201|405) ;;
                                             *) echo "Cannot create the Nextcloud folder (HTTP $code)" >&2; exit 1 ;;
@@ -137,9 +139,10 @@ pipeline {
         stage('Notify Discord') {
             steps {
                 script {
-                    def payload = discordPayload(lang: env.NOTIFY_LANG, state: env.NOTIF_STATE, type: env.NOTIF_TYPE, host: env.NOTIF_HOST,
-                                                 title: env.NOTIF_TITLE, date: env.NOTIF_ISO_DATE,
-                                                 logFile: env.LOG_FILE, logUrl: env.LOG_URL, build: env.BUILD_NUMBER)
+                    def payload = discordPayload(
+                        lang: env.NOTIFY_LANG, state: env.NOTIF_STATE, type: env.NOTIF_TYPE,
+                        host: env.NOTIF_HOST, title: env.NOTIF_TITLE, date: env.NOTIF_ISO_DATE,
+                        logFile: env.LOG_FILE, logUrl: env.LOG_URL, build: env.BUILD_NUMBER)
                     writeFile file: 'discord-payload.json', text: payload
                     withCredentials([string(credentialsId: env.DISCORD_CREDENTIALS, variable: 'DISCORD_WEBHOOK')]) {
                         sh '''
@@ -152,7 +155,7 @@ pipeline {
                                     --header 'Content-Type: application/json' --data-binary @discord-payload.json
                         '''
                     }
-                    echo "Message sent to Discord."
+                    echo 'Message sent to Discord'
                 }
             }
         }
