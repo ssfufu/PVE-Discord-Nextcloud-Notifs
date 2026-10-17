@@ -1,5 +1,18 @@
+// Proxmox VE / Backup Server notifications to Nextcloud and Discord.
+//
+// Proxmox sends a webhook to the Generic Webhook Trigger plugin. The full log is
+// stored in Nextcloud and a summary with a link to it is posted to Discord.
+// See README.md for the setup.
+
 pipeline {
     agent any
+
+    options {
+        timeout(time: 15, unit: 'MINUTES')
+        // Build parameters contain the full logs: do not keep them forever.
+        buildDiscarder(logRotator(numToKeepStr: '100', daysToKeepStr: '30'))
+        disableResume()
+    }
 
     environment {
         // Settings: adjust them to your setup.
@@ -146,8 +159,8 @@ pipeline {
     }
     post {
         always {
-            echo "Pipeline completed"
-            cleanWs()
+            // Remove the log and the payload from the agent.
+            deleteDir()
         }
     }
 }
