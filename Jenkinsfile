@@ -72,49 +72,52 @@ pipeline {
         }
         stage('Upload to Nextcloud') {
             steps {
-                script {
-                    echo "Uploading logs to Nextcloud"
-                    withCredentials([usernamePassword(credentialsId: env.NEXTCLOUD_CREDENTIALS,
-                                                      usernameVariable: 'NC_USER', passwordVariable: 'NC_PASS')]) {
-                        def base = env.NEXTCLOUD_URL.replaceAll('/+$', '')
-                        if (!base.startsWith('https://')) {
-                            error "NEXTCLOUD_URL must start with https://"
+                // A Nextcloud failure must not prevent the Discord notification.
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    script {
+                        echo "Uploading logs to Nextcloud"
+                        withCredentials([usernamePassword(credentialsId: env.NEXTCLOUD_CREDENTIALS,
+                                                          usernameVariable: 'NC_USER', passwordVariable: 'NC_PASS')]) {
+                            def base = env.NEXTCLOUD_URL.replaceAll('/+$', '')
+                            if (!base.startsWith('https://')) {
+                                error "NEXTCLOUD_URL must start with https://"
+                            }
+                            def davRoot = "${base}/remote.php/dav/files/${urlEncode(env.NC_USER)}"
+                            def folder = davPath(env.NEXTCLOUD_FOLDER)
+
+                            // Values go through the environment and are never interpolated into the script.
+                            // The credentials are given to curl on stdin, so they do not show in the process list.
+                            withEnv(["NC_DAV_ROOT=${davRoot}", "NC_FOLDER=${folder}"]) {
+                                sh '''
+                                    set -euf
+                                    esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
+                                    auth=$(printf 'user = "%s:%s"' "$(esc "$NC_USER")" "$(esc "$NC_PASS")")
+                                    dav() {
+                                        printf '%s\\n' "$auth" | curl --config - --silent --show-error \\
+                                            --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 300 \\
+                                            --retry 5 --retry-delay 10 --retry-connrefused "$@"
+                                    }
+
+                                    # Create the folder tree if needed (201: created, 405: already exists).
+                                    url=$NC_DAV_ROOT
+                                    IFS=/
+                                    for part in $NC_FOLDER; do
+                                        url="$url/$part"
+                                        code=$(dav --output /dev/null --write-out '%{http_code}' --request MKCOL "$url/")
+                                        case $code in
+                                            201|405) ;;
+                                            *) echo "Cannot create the Nextcloud folder (HTTP $code)" >&2; exit 1 ;;
+                                        esac
+                                    done
+                                    unset IFS
+
+                                    dav --fail --output /dev/null --upload-file "$LOG_FILE" "$url/$LOG_FILE"
+                                '''
+                            }
+                            env.LOG_URL = folder ? "${davRoot}/${folder}/${env.LOG_FILE}" : "${davRoot}/${env.LOG_FILE}"
                         }
-                        def davRoot = "${base}/remote.php/dav/files/${urlEncode(env.NC_USER)}"
-                        def folder = davPath(env.NEXTCLOUD_FOLDER)
-
-                        // Values go through the environment and are never interpolated into the script.
-                        // The credentials are given to curl on stdin, so they do not show in the process list.
-                        withEnv(["NC_DAV_ROOT=${davRoot}", "NC_FOLDER=${folder}"]) {
-                            sh '''
-                                set -euf
-                                esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
-                                auth=$(printf 'user = "%s:%s"' "$(esc "$NC_USER")" "$(esc "$NC_PASS")")
-                                nc() {
-                                    printf '%s\\n' "$auth" | curl --config - --silent --show-error \\
-                                        --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 300 \\
-                                        --retry 5 --retry-delay 10 --retry-connrefused "$@"
-                                }
-
-                                # Create the folder tree if needed (201: created, 405: already exists).
-                                url=$NC_DAV_ROOT
-                                IFS=/
-                                for part in $NC_FOLDER; do
-                                    url="$url/$part"
-                                    code=$(nc --output /dev/null --write-out '%{http_code}' --request MKCOL "$url/")
-                                    case $code in
-                                        201|405) ;;
-                                        *) echo "Cannot create the Nextcloud folder (HTTP $code)" >&2; exit 1 ;;
-                                    esac
-                                done
-                                unset IFS
-
-                                nc --fail --output /dev/null --upload-file "$LOG_FILE" "$url/$LOG_FILE"
-                            '''
-                        }
-                        env.LOG_URL = "${davRoot}/${folder}/${env.LOG_FILE}"
+                        echo "Log uploaded to Nextcloud: ${env.LOG_FILE}"
                     }
-                    echo "File uploaded successfully: ${env.LOG_FILE}"
                 }
             }
         }
@@ -123,7 +126,7 @@ pipeline {
                 script {
                     def payload = discordPayload(lang: env.NOTIFY_LANG, state: env.NOTIF_STATE, type: env.NOTIF_TYPE, host: env.NOTIF_HOST,
                                                  title: env.NOTIF_TITLE, date: env.NOTIF_ISO_DATE,
-                                                 logFile: env.LOG_FILE, logUrl: env.LOG_URL)
+                                                 logFile: env.LOG_FILE, logUrl: env.LOG_URL, build: env.BUILD_NUMBER)
                     writeFile file: 'discord-payload.json', text: payload
                     withCredentials([string(credentialsId: env.DISCORD_CREDENTIALS, variable: 'DISCORD_WEBHOOK')]) {
                         sh '''
@@ -178,6 +181,7 @@ Map texts(String lang) {
         ],
         status: 'Status',
         log: 'Log file',
+        logMissing: 'Not available: the upload to Nextcloud failed (Jenkins build #%s)',
     ]
     all.fr = [
         types: [
@@ -204,6 +208,7 @@ Map texts(String lang) {
         ],
         status: 'Statut',
         log: 'Fichier de log',
+        logMissing: "Indisponible : l'envoi vers Nextcloud a échoué (build Jenkins #%s)",
     ]
     return all[lang] ?: all.en
 }
@@ -222,6 +227,7 @@ String discordPayload(Map n) {
     def style = styles[n.state] ?: ['\u2754', 0x95A5A6]
     def action = t.types[n.type] ?: n.type
     def status = t.states[n.state] ?: "${t.states.unknown} (${n.state})"
+    def logLink = n.logUrl ? "[${n.logFile}](${n.logUrl})".toString() : String.format(t.logMissing, n.build)
 
     def embed = [
         title: truncate("${style[0]} ${n.host} \u2014 ${action}", 256),
@@ -229,7 +235,7 @@ String discordPayload(Map n) {
         timestamp: n.date,
         fields: [
             [name: t.status, value: status.toString(), inline: true],
-            [name: t.log, value: "[${n.logFile}](${n.logUrl})".toString(), inline: true],
+            [name: t.log, value: logLink, inline: true],
         ],
     ]
     if (n.title) {
