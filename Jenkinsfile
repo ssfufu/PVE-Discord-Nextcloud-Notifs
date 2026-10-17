@@ -61,19 +61,42 @@ pipeline {
                     withCredentials([usernamePassword(credentialsId: env.NEXTCLOUD_CREDENTIALS,
                                                       usernameVariable: 'NC_USER', passwordVariable: 'NC_PASS')]) {
                         def base = env.NEXTCLOUD_URL.replaceAll('/+$', '')
-                        def nextcloudURL = "${base}/remote.php/dav/files/${urlEncode(env.NC_USER)}/${davPath(env.NEXTCLOUD_FOLDER)}/${env.LOG_FILE}"
+                        if (!base.startsWith('https://')) {
+                            error "NEXTCLOUD_URL must start with https://"
+                        }
+                        def davRoot = "${base}/remote.php/dav/files/${urlEncode(env.NC_USER)}"
+                        def folder = davPath(env.NEXTCLOUD_FOLDER)
 
                         // Values go through the environment and are never interpolated into the script.
                         // The credentials are given to curl on stdin, so they do not show in the process list.
-                        withEnv(["NC_URL=${nextcloudURL}"]) {
+                        withEnv(["NC_DAV_ROOT=${davRoot}", "NC_FOLDER=${folder}"]) {
                             sh '''
-                                set -eu
+                                set -euf
                                 esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
-                                printf 'user = "%s:%s"\\n' "$(esc "$NC_USER")" "$(esc "$NC_PASS")" |
-                                    curl --config - -T "./$LOG_FILE" "$NC_URL"
+                                auth=$(printf 'user = "%s:%s"' "$(esc "$NC_USER")" "$(esc "$NC_PASS")")
+                                nc() {
+                                    printf '%s\\n' "$auth" | curl --config - --silent --show-error \\
+                                        --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 300 \\
+                                        --retry 5 --retry-delay 10 --retry-connrefused "$@"
+                                }
+
+                                # Create the folder tree if needed (201: created, 405: already exists).
+                                url=$NC_DAV_ROOT
+                                IFS=/
+                                for part in $NC_FOLDER; do
+                                    url="$url/$part"
+                                    code=$(nc --output /dev/null --write-out '%{http_code}' --request MKCOL "$url/")
+                                    case $code in
+                                        201|405) ;;
+                                        *) echo "Cannot create the Nextcloud folder (HTTP $code)" >&2; exit 1 ;;
+                                    esac
+                                done
+                                unset IFS
+
+                                nc --fail --output /dev/null --upload-file "$LOG_FILE" "$url/$LOG_FILE"
                             '''
                         }
-                        env.PROTECTED_URL = nextcloudURL
+                        env.PROTECTED_URL = "${davRoot}/${folder}/${env.LOG_FILE}"
                     }
                     echo "File uploaded successfully: ${env.LOG_FILE}"
                 }
@@ -145,7 +168,10 @@ pipeline {
                             set -eu
                             esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
                             printf 'url = "%s"\\n' "$(esc "$DISCORD_WEBHOOK")" |
-                                curl --config - -H "Content-Type: application/json" --data-binary @discord-payload.json
+                                curl --config - --silent --show-error --fail --output /dev/null \\
+                                    --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 60 \\
+                                    --retry 5 --retry-delay 5 --retry-connrefused \\
+                                    --header 'Content-Type: application/json' --data-binary @discord-payload.json
                         '''
                     }
                     echo "Message successfully sent to Discord."
