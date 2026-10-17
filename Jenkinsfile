@@ -27,7 +27,7 @@ pipeline {
                     env.X_FORMATTED_TIMESTAMP = formattedTimestamp
 
                     echo "Generated timestamp: ${env.X_BACKUP_TIMESTAMP}"
-                    echo "${params.X_STATE} ${params.X_TYPE} ${env.X_BACKUP_TIMESTAMP} ${params.X_HOST} ${params.X_FQDN} ${params.X_USER} ${params.X_PASSWORD} ${params.X_DISCORD_WEBHOOK}"
+                    echo "State: ${params.X_STATE}, type: ${params.X_TYPE}, host: ${params.X_HOST}"
                 }
             }
         }
