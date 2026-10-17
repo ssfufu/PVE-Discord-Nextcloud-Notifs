@@ -1,151 +1,284 @@
+// Proxmox VE / Backup Server notifications to Nextcloud and Discord.
+//
+// Proxmox sends a webhook to the Generic Webhook Trigger plugin. The full log is
+// stored in Nextcloud and a summary with a link to it is posted to Discord.
+// See README.md for the setup.
+
 pipeline {
     agent any
+
+    options {
+        timeout(time: 15, unit: 'MINUTES')
+        // Build parameters contain the full logs: do not keep them forever.
+        buildDiscarder(logRotator(numToKeepStr: '100', daysToKeepStr: '30'))
+        disableResume()
+    }
+
+    environment {
+        // Settings: adjust them to your setup.
+        NEXTCLOUD_URL         = 'https://cloud.example.com'  // base URL of the Nextcloud server
+        NEXTCLOUD_FOLDER      = 'BACKUP-LOGS'                // folder where the logs are stored
+        NOTIFY_LANG           = 'en'                         // language of the Discord messages: 'en' or 'fr'
+        // IDs of the Jenkins credentials (Manage Jenkins > Credentials).
+        NEXTCLOUD_CREDENTIALS = 'nextcloud-backup-logs'      // "Username with password" (use an app password)
+        DISCORD_CREDENTIALS   = 'discord-webhook'            // "Secret text" containing the webhook URL
+    }
+
     parameters {
-        string(name: 'X_STATE', defaultValue: '', description: 'Backup state')
-        string(name: 'X_LOG_CONTENT', defaultValue: 'If you are reading this outside of Jenkins, something went wrong', description: 'Log content received from Proxmox')
-        string(name: 'X_FQDN', defaultValue: '', description: 'FQDN of the Nextcloud server')
-        string(name: 'X_USER', defaultValue: '', description: 'Nextcloud username')
-        string(name: 'X_PASSWORD', defaultValue: '', description: 'Nextcloud user password')
-        string(name: 'X_DISCORD_WEBHOOK', defaultValue: '', description: 'Discord webhook')
-        string(name: 'X_TYPE', defaultValue: '', description: 'Type of action')
-        string(name: 'X_HOST', defaultValue: '', description: 'Hostname of the Proxmox server')
-        string(name: 'X_FORMATTED_TIMESTAMP', defaultValue: '', description: 'Backup timestamp')
+        // Filled by the webhook, or by hand to test the job.
+        string(name: 'X_STATE', defaultValue: '', description: 'Severity: info, notice, warning, error or unknown')
+        string(name: 'X_TYPE', defaultValue: '', description: 'Type: vzdump, package-updates, gc, prune, verify...')
+        string(name: 'X_HOST', defaultValue: '', description: 'Name of the Proxmox server')
+        string(name: 'X_TITLE', defaultValue: '', description: 'Notification title (optional)')
+        string(name: 'X_TIMESTAMP', defaultValue: '', description: 'Notification time as a Unix timestamp (optional)')
+        text(name: 'X_LOG_CONTENT', defaultValue: '', description: 'Notification body (full log)')
+    }
+
+    // Generic Webhook Trigger: Proxmox calls /generic-webhook-trigger/invoke with the token
+    // stored in the "proxmox-webhook-token" credential ("Secret text").
+    // The body is never printed: it contains the full log.
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'X_STATE', value: '$.X_STATE', regexpFilter: '[^a-z]'],
+                [key: 'X_TYPE', value: '$.X_TYPE', regexpFilter: '[^a-z0-9-]'],
+                [key: 'X_HOST', value: '$.X_HOST', regexpFilter: '[^A-Za-z0-9._-]'],
+                [key: 'X_TITLE', value: '$.X_TITLE'],
+                [key: 'X_TIMESTAMP', value: '$.X_TIMESTAMP', regexpFilter: '[^0-9]'],
+                [key: 'X_LOG_CONTENT', value: '$.X_LOG_CONTENT'],
+            ],
+            tokenCredentialId: 'proxmox-webhook-token',
+            causeString: 'Proxmox notification: $X_TYPE ($X_STATE) from $X_HOST',
+            printContributedVariables: false,
+            printPostContent: false
+        )
     }
 
     stages {
-        stage('Initialization') {
+        stage('Prepare') {
             steps {
                 script {
-                    echo "Initialization"
-
-                    // This timestamp will be used for the name of the log file.
-                    def timestamp = new Date().format("yyyy-MM-dd_HH-mm-ss", TimeZone.getTimeZone('UTC'))
-                    env.X_BACKUP_TIMESTAMP = timestamp
-
-                    // Here I format the time for my needs, it's the one displayed in the Discord message.
-                    def formattedTimestamp = new Date().format("dd/MM/yyyy", TimeZone.getTimeZone('UTC'))
-                    env.X_FORMATTED_TIMESTAMP = formattedTimestamp
-
-                    echo "Generated timestamp: ${env.X_BACKUP_TIMESTAMP}"
-                    echo "${params.X_STATE} ${params.X_TYPE} ${env.X_BACKUP_TIMESTAMP} ${params.X_HOST} ${params.X_FQDN} ${params.X_USER} ${params.X_PASSWORD} ${params.X_DISCORD_WEBHOOK}"
-                }
-            }
-        }
-        stage('Save logs locally') {
-            steps {
-                script {
-                    echo "Saving logs locally"
-                    if (!params.X_LOG_CONTENT || params.X_LOG_CONTENT.trim().isEmpty()) {
-                        error "Logs are empty or have not been received."
+                    if (!params.X_LOG_CONTENT?.trim()) {
+                        error 'The notification body is empty'
                     }
 
-                    // Creating the log file in the local workspace. (It will be removed at the end of the job).
-                    def logFileName = "${params.X_TYPE}-log-${env.X_BACKUP_TIMESTAMP}.log"
-                    writeFile file: logFileName, text: params.X_LOG_CONTENT
-                    env.LOG_FILE = logFileName
-                    echo "File saved locally: ${logFileName}"
+                    // Values come from the webhook body: only keep safe characters,
+                    // even when the job is started by hand.
+                    env.NOTIF_STATE = clean(params.X_STATE, '[^a-z]') ?: 'unknown'
+                    env.NOTIF_TYPE = clean(params.X_TYPE, '[^a-z0-9-]') ?: 'action'
+                    env.NOTIF_HOST = clean(params.X_HOST, '[^A-Za-z0-9._-]') ?: 'proxmox'
+                    env.NOTIF_TITLE = truncate((params.X_TITLE ?: '').trim(), 200)
+
+                    // Time of the notification sent by Proxmox, or now.
+                    def ts = clean(params.X_TIMESTAMP, '[^0-9]')
+                    def date = ts ? new Date(Long.parseLong(truncate(ts, 12)) * 1000L) : new Date()
+                    def utc = TimeZone.getTimeZone('UTC')
+                    env.NOTIF_DATE = date.format('dd/MM/yyyy HH:mm', utc) + ' UTC'
+                    env.NOTIF_ISO_DATE = date.format("yyyy-MM-dd'T'HH:mm:ss'Z'", utc)
+
+                    env.LOG_FILE = "${env.NOTIF_HOST}_${env.NOTIF_TYPE}_${date.format('yyyy-MM-dd_HH-mm-ss', utc)}.log"
+                    writeFile file: env.LOG_FILE, text: params.X_LOG_CONTENT
+
+                    echo "Notification: ${env.NOTIF_TYPE} (${env.NOTIF_STATE}) from ${env.NOTIF_HOST}"
+                    echo "Log file: ${env.LOG_FILE}"
                 }
             }
         }
         stage('Upload to Nextcloud') {
             steps {
-                script {
-                    
-                    echo "Uploading logs to Nextcloud"
-                    if (!params.X_FQDN || !params.X_USER || !params.X_PASSWORD) {
-                        error "Nextcloud parameters (FQDN, username, password) are not defined."
+                // A Nextcloud failure must not prevent the Discord notification.
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    script {
+                        echo 'Uploading the log to Nextcloud'
+                        withCredentials([usernamePassword(credentialsId: env.NEXTCLOUD_CREDENTIALS,
+                                                          usernameVariable: 'NC_USER', passwordVariable: 'NC_PASS')]) {
+                            def base = env.NEXTCLOUD_URL.replaceAll('/+$', '')
+                            if (!base.startsWith('https://')) {
+                                error 'NEXTCLOUD_URL must start with https://'
+                            }
+                            def davRoot = "${base}/remote.php/dav/files/${urlEncode(env.NC_USER)}"
+                            def folder = davPath(env.NEXTCLOUD_FOLDER)
+
+                            // Values go through the environment and are never interpolated into the script.
+                            // The credentials are given to curl on stdin, so they do not show in the process list.
+                            withEnv(["NC_DAV_ROOT=${davRoot}", "NC_FOLDER=${folder}"]) {
+                                sh '''
+                                    set -euf
+                                    esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
+                                    auth=$(printf 'user = "%s:%s"' "$(esc "$NC_USER")" "$(esc "$NC_PASS")")
+                                    dav() {
+                                        printf '%s\\n' "$auth" | curl --config - --silent --show-error \\
+                                            --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 300 \\
+                                            --retry 5 --retry-delay 10 --retry-connrefused "$@"
+                                    }
+
+                                    # Create the folder tree if needed (201: created, 405: already exists).
+                                    url=$NC_DAV_ROOT
+                                    IFS=/
+                                    for part in $NC_FOLDER; do
+                                        url="$url/$part"
+                                        code=$(dav --request MKCOL --output /dev/null \\
+                                            --write-out '%{http_code}' "$url/")
+                                        case $code in
+                                            201|405) ;;
+                                            *) echo "Cannot create the Nextcloud folder (HTTP $code)" >&2; exit 1 ;;
+                                        esac
+                                    done
+                                    unset IFS
+
+                                    dav --fail --output /dev/null --upload-file "$LOG_FILE" "$url/$LOG_FILE"
+                                '''
+                            }
+                            env.LOG_URL = folder ? "${davRoot}/${folder}/${env.LOG_FILE}" : "${davRoot}/${env.LOG_FILE}"
+                        }
+                        echo "Log uploaded to Nextcloud: ${env.LOG_FILE}"
                     }
-                    
-                    def nextcloudURL = "https://${params.X_FQDN}/remote.php/dav/files/${params.X_USER}/BACKUP-LOGS/${env.LOG_FILE}"
-                  
-                    // This works, but it lacks the option to hide the user and password in the Jenkins job logs.
-                    // It might also need some retries in case the Nextcloud server is unavailable for a few seconds/minutes/hours/etc.
-                    sh """
-                    curl -u ${params.X_USER}:${params.X_PASSWORD} -T ./${env.LOG_FILE} ${nextcloudURL}
-                    """
-                    
-                    env.PROTECTED_URL = nextcloudURL
-                    echo "File uploaded successfully: ${env.PROTECTED_URL}"
                 }
             }
         }
-        stage('Send link to Discord') {
+        stage('Notify Discord') {
             steps {
                 script {
-                    echo "Sending link to Discord"
-                    if (!params.X_DISCORD_WEBHOOK) {
-                        error "Discord webhook is not defined."
+                    def payload = discordPayload(
+                        lang: env.NOTIFY_LANG, state: env.NOTIF_STATE, type: env.NOTIF_TYPE,
+                        host: env.NOTIF_HOST, title: env.NOTIF_TITLE, date: env.NOTIF_ISO_DATE,
+                        logFile: env.LOG_FILE, logUrl: env.LOG_URL, build: env.BUILD_NUMBER)
+                    writeFile file: 'discord-payload.json', text: payload
+                    withCredentials([string(credentialsId: env.DISCORD_CREDENTIALS, variable: 'DISCORD_WEBHOOK')]) {
+                        sh '''
+                            set -eu
+                            esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
+                            printf 'url = "%s"\\n' "$(esc "$DISCORD_WEBHOOK")" |
+                                curl --config - --silent --show-error --fail --output /dev/null \\
+                                    --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 60 \\
+                                    --retry 5 --retry-delay 5 --retry-connrefused \\
+                                    --header 'Content-Type: application/json' --data-binary @discord-payload.json
+                        '''
                     }
-                  
-                    // Not sure about the usage of the two next switch/case.
-                    // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.  
-                    def actionType = ""
-                    switch(params.X_TYPE) {
-                        case "package-updates":
-                            actionType = "Package updates"
-                            break
-                        case "prune":
-                            actionType = "Pruning"
-                            break
-                        case "gc":
-                            actionType = "Garbage collection"
-                            break
-                        case "verification":
-                            actionType = "Verification"
-                            break
-                        case "vzdump":
-                            actionType = "Backup"
-                            break
-                        default:
-                            actionType = "Action"
-                        break
-                    }
-
-                    // Creating the first part of the Discord message, which content's different by reading the <severity> variable sent by the PVE or PBS. 
-                    switch(params.X_STATE) {
-                        case "info":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} was successfully completed."
-                            break
-                        case "error":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} failed."
-                            break
-                        case "notice":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} completed with errors."
-                            break
-                        case "warning":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} completed with warnings."
-                            break
-                        case "unknown":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} has an unknown state: ${params.X_STATE}"
-                            break
-                        default:
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} has an unrecognized state (default message): ${params.X_STATE}"
-                            break
-                    }
-
-                    // Second part of the Discord message, it contains the URL to download the log file (protected by the basic authentication module of Nextcloud).
-                    def logMessage = "The log file is available here: ${env.PROTECTED_URL}"
-
-                    // Assembly of the Discord message.
-                    def discordMessage = groovy.json.JsonOutput.toJson([
-                        content: "${stateMessage} ${logMessage}"
-                    ])
-
-                    echo "Message for Discord: ${discordMessage}"
-                    sh """
-                    curl -H "Content-Type: application/json" -X POST \
-                    -d '${discordMessage}' \
-                    ${params.X_DISCORD_WEBHOOK}
-                    """
-                    echo "Message successfully sent to Discord."
+                    echo 'Message sent to Discord'
                 }
             }
         }
     }
     post {
         always {
-            echo "Pipeline completed"
-            cleanWs()
+            // Remove the log and the payload from the agent.
+            deleteDir()
         }
     }
+}
+
+// Labels used in the Discord message, per language.
+@NonCPS
+Map texts(String lang) {
+    def all = [:]
+    all.en = [
+        types: [
+            'vzdump': 'Backup',
+            'package-updates': 'Package updates',
+            'replication': 'Replication',
+            'fencing': 'Fencing',
+            'system-mail': 'System mail',
+            'gc': 'Garbage collection',
+            'prune': 'Prune',
+            'sync': 'Sync',
+            'verify': 'Verification',
+            'verification': 'Verification',
+            'tape-backup': 'Tape backup',
+            'tape-load': 'Tape load',
+            'acme': 'Certificate renewal',
+        ],
+        states: [
+            info: 'Success',
+            notice: 'Completed with notices',
+            warning: 'Completed with warnings',
+            error: 'Failure',
+            unknown: 'Unknown',
+        ],
+        status: 'Status',
+        log: 'Log file',
+        logMissing: 'Not available: the upload to Nextcloud failed (Jenkins build #%s)',
+    ]
+    all.fr = [
+        types: [
+            'vzdump': 'Sauvegarde',
+            'package-updates': 'Mise à jour des paquets',
+            'replication': 'Réplication',
+            'fencing': 'Fencing',
+            'system-mail': 'Mail système',
+            'gc': 'Garbage collection',
+            'prune': 'Nettoyage',
+            'sync': 'Synchronisation',
+            'verify': 'Vérification',
+            'verification': 'Vérification',
+            'tape-backup': 'Sauvegarde sur bande',
+            'tape-load': 'Chargement de bande',
+            'acme': 'Renouvellement de certificat',
+        ],
+        states: [
+            info: 'Succès',
+            notice: 'Terminé avec des remarques',
+            warning: 'Terminé avec des avertissements',
+            error: 'Échec',
+            unknown: 'Inconnu',
+        ],
+        status: 'Statut',
+        log: 'Fichier de log',
+        logMissing: "Indisponible : l'envoi vers Nextcloud a échoué (build Jenkins #%s)",
+    ]
+    return all[lang] ?: all.en
+}
+
+// Builds the Discord message: one embed, colored by severity.
+// Mentions are disabled, so a value such as "@everyone" cannot ping anybody.
+@NonCPS
+String discordPayload(Map n) {
+    def t = texts(n.lang)
+    def styles = [
+        info: ['\u2705', 0x2ECC71],
+        notice: ['\u2139\uFE0F', 0x3498DB],
+        warning: ['\u26A0\uFE0F', 0xE67E22],
+        error: ['\u274C', 0xE74C3C],
+    ]
+    def style = styles[n.state] ?: ['\u2754', 0x95A5A6]
+    def action = t.types[n.type] ?: n.type
+    def status = t.states[n.state] ?: "${t.states.unknown} (${n.state})"
+    def logLink = n.logUrl ? "[${n.logFile}](${n.logUrl})".toString() : String.format(t.logMissing, n.build)
+
+    def embed = [
+        title: truncate("${style[0]} ${n.host} \u2014 ${action}", 256),
+        color: style[1],
+        timestamp: n.date,
+        fields: [
+            [name: t.status, value: status.toString(), inline: true],
+            [name: t.log, value: logLink, inline: true],
+        ],
+    ]
+    if (n.title) {
+        embed.description = n.title
+    }
+    return groovy.json.JsonOutput.toJson([allowed_mentions: [parse: []], embeds: [embed]])
+}
+
+// Encodes one segment of a URL path.
+@NonCPS
+String urlEncode(String value) {
+    return URLEncoder.encode(value, 'UTF-8').replace('+', '%20')
+}
+
+// Encodes a folder path ("a/b c" -> "a/b%20c"), ignoring empty segments.
+@NonCPS
+String davPath(String folder) {
+    return folder.split('/').findAll { it }.collect { urlEncode(it) }.join('/')
+}
+
+// Removes the characters matching the pattern.
+@NonCPS
+String clean(String value, String pattern) {
+    return (value ?: '').replaceAll(pattern, '')
+}
+
+@NonCPS
+String truncate(String value, int max) {
+    return value.length() > max ? value.substring(0, max) : value
 }
