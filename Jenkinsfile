@@ -11,11 +11,13 @@ pipeline {
     }
 
     parameters {
-        string(name: 'X_STATE', defaultValue: '', description: 'Backup state')
-        string(name: 'X_LOG_CONTENT', defaultValue: 'If you are reading this outside of Jenkins, something went wrong', description: 'Log content received from Proxmox')
-        string(name: 'X_TYPE', defaultValue: '', description: 'Type of action')
-        string(name: 'X_HOST', defaultValue: '', description: 'Hostname of the Proxmox server')
-        string(name: 'X_FORMATTED_TIMESTAMP', defaultValue: '', description: 'Backup timestamp')
+        // Filled by the webhook, or by hand to test the job.
+        string(name: 'X_STATE', defaultValue: '', description: 'Severity: info, notice, warning, error or unknown')
+        string(name: 'X_TYPE', defaultValue: '', description: 'Notification type: vzdump, package-updates, gc, prune, verify...')
+        string(name: 'X_HOST', defaultValue: '', description: 'Name of the Proxmox server')
+        string(name: 'X_TITLE', defaultValue: '', description: 'Notification title (optional)')
+        string(name: 'X_TIMESTAMP', defaultValue: '', description: 'Notification time as a Unix timestamp (optional)')
+        text(name: 'X_LOG_CONTENT', defaultValue: '', description: 'Notification body (full log)')
     }
 
     // Generic Webhook Trigger: Proxmox calls /generic-webhook-trigger/invoke with the token
@@ -27,6 +29,8 @@ pipeline {
                 [key: 'X_STATE', value: '$.X_STATE', regexpFilter: '[^a-z]'],
                 [key: 'X_TYPE', value: '$.X_TYPE', regexpFilter: '[^a-z0-9-]'],
                 [key: 'X_HOST', value: '$.X_HOST', regexpFilter: '[^A-Za-z0-9._-]'],
+                [key: 'X_TITLE', value: '$.X_TITLE'],
+                [key: 'X_TIMESTAMP', value: '$.X_TIMESTAMP', regexpFilter: '[^0-9]'],
                 [key: 'X_LOG_CONTENT', value: '$.X_LOG_CONTENT'],
             ],
             tokenCredentialId: 'proxmox-webhook-token',
@@ -37,38 +41,31 @@ pipeline {
     }
 
     stages {
-        stage('Initialization') {
+        stage('Prepare') {
             steps {
                 script {
-                    echo "Initialization"
-
-                    // This timestamp will be used for the name of the log file.
-                    def timestamp = new Date().format("yyyy-MM-dd_HH-mm-ss", TimeZone.getTimeZone('UTC'))
-                    env.X_BACKUP_TIMESTAMP = timestamp
-
-                    // Here I format the time for my needs, it's the one displayed in the Discord message.
-                    def formattedTimestamp = new Date().format("dd/MM/yyyy", TimeZone.getTimeZone('UTC'))
-                    env.X_FORMATTED_TIMESTAMP = formattedTimestamp
-
-                    echo "Generated timestamp: ${env.X_BACKUP_TIMESTAMP}"
-                    echo "State: ${params.X_STATE}, type: ${params.X_TYPE}, host: ${params.X_HOST}"
-                }
-            }
-        }
-        stage('Save logs locally') {
-            steps {
-                script {
-                    echo "Saving logs locally"
-                    if (!params.X_LOG_CONTENT || params.X_LOG_CONTENT.trim().isEmpty()) {
-                        error "Logs are empty or have not been received."
+                    if (!params.X_LOG_CONTENT?.trim()) {
+                        error "The notification body is empty."
                     }
 
-                    // The type comes from the webhook body: only keep safe characters.
-                    def safeType = (params.X_TYPE ?: '').replaceAll('[^A-Za-z0-9_-]', '') ?: 'action'
-                    def logFileName = "${safeType}-log-${env.X_BACKUP_TIMESTAMP}.log"
-                    writeFile file: logFileName, text: params.X_LOG_CONTENT
-                    env.LOG_FILE = logFileName
-                    echo "File saved locally: ${logFileName}"
+                    // Values come from the webhook body: only keep safe characters,
+                    // even when the job is started by hand.
+                    env.NOTIF_STATE = clean(params.X_STATE, '[^a-z]') ?: 'unknown'
+                    env.NOTIF_TYPE = clean(params.X_TYPE, '[^a-z0-9-]') ?: 'action'
+                    env.NOTIF_HOST = clean(params.X_HOST, '[^A-Za-z0-9._-]') ?: 'proxmox'
+                    env.NOTIF_TITLE = truncate((params.X_TITLE ?: '').trim(), 200)
+
+                    // Time of the notification sent by Proxmox, or now.
+                    def ts = clean(params.X_TIMESTAMP, '[^0-9]')
+                    def date = ts ? new Date(Long.parseLong(truncate(ts, 12)) * 1000L) : new Date()
+                    def utc = TimeZone.getTimeZone('UTC')
+                    env.NOTIF_DATE = date.format('dd/MM/yyyy HH:mm', utc) + ' UTC'
+                    env.NOTIF_ISO_DATE = date.format("yyyy-MM-dd'T'HH:mm:ss'Z'", utc)
+
+                    env.LOG_FILE = "${env.NOTIF_HOST}_${env.NOTIF_TYPE}_${date.format('yyyy-MM-dd_HH-mm-ss', utc)}.log"
+                    writeFile file: env.LOG_FILE, text: params.X_LOG_CONTENT
+
+                    echo "Notification: ${env.NOTIF_TYPE} (${env.NOTIF_STATE}) from ${env.NOTIF_HOST}, log file ${env.LOG_FILE}"
                 }
             }
         }
@@ -129,7 +126,7 @@ pipeline {
                     // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.
                     def actionType = ""
                     def stateMessage = ""
-                    switch(params.X_TYPE) {
+                    switch(env.NOTIF_TYPE) {
                         case "package-updates":
                             actionType = "Package updates"
                             break
@@ -139,6 +136,7 @@ pipeline {
                         case "gc":
                             actionType = "Garbage collection"
                             break
+                        case "verify":
                         case "verification":
                             actionType = "Verification"
                             break
@@ -151,24 +149,24 @@ pipeline {
                     }
 
                     // Creating the first part of the Discord message, which content's different by reading the <severity> variable sent by the PVE or PBS.
-                    switch(params.X_STATE) {
+                    switch(env.NOTIF_STATE) {
                         case "info":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} was successfully completed."
+                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} was successfully completed."
                             break
                         case "error":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} failed."
+                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} failed."
                             break
                         case "notice":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} completed with errors."
+                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} completed with errors."
                             break
                         case "warning":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} completed with warnings."
+                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} completed with warnings."
                             break
                         case "unknown":
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} has an unknown state: ${params.X_STATE}"
+                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} has an unknown state: ${env.NOTIF_STATE}"
                             break
                         default:
-                            stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} has an unrecognized state (default message): ${params.X_STATE}"
+                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} has an unrecognized state (default message): ${env.NOTIF_STATE}"
                             break
                     }
 
@@ -215,4 +213,15 @@ String urlEncode(String value) {
 @NonCPS
 String davPath(String folder) {
     return folder.split('/').findAll { it }.collect { urlEncode(it) }.join('/')
+}
+
+// Removes the characters matching the pattern.
+@NonCPS
+String clean(String value, String pattern) {
+    return (value ?: '').replaceAll(pattern, '')
+}
+
+@NonCPS
+String truncate(String value, int max) {
+    return value.length() > max ? value.substring(0, max) : value
 }
