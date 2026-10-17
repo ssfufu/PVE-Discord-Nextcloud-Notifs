@@ -1,12 +1,18 @@
 pipeline {
     agent any
+
+    environment {
+        // Settings: adjust them to your setup.
+        NEXTCLOUD_URL         = 'https://cloud.example.com'  // base URL of the Nextcloud server
+        NEXTCLOUD_FOLDER      = 'BACKUP-LOGS'                // folder where the logs are stored
+        // IDs of the Jenkins credentials (Manage Jenkins > Credentials).
+        NEXTCLOUD_CREDENTIALS = 'nextcloud-backup-logs'      // "Username with password" (use an app password)
+        DISCORD_CREDENTIALS   = 'discord-webhook'            // "Secret text" containing the webhook URL
+    }
+
     parameters {
         string(name: 'X_STATE', defaultValue: '', description: 'Backup state')
         string(name: 'X_LOG_CONTENT', defaultValue: 'If you are reading this outside of Jenkins, something went wrong', description: 'Log content received from Proxmox')
-        string(name: 'X_FQDN', defaultValue: '', description: 'FQDN of the Nextcloud server')
-        string(name: 'X_USER', defaultValue: '', description: 'Nextcloud username')
-        string(name: 'X_PASSWORD', defaultValue: '', description: 'Nextcloud user password')
-        string(name: 'X_DISCORD_WEBHOOK', defaultValue: '', description: 'Discord webhook')
         string(name: 'X_TYPE', defaultValue: '', description: 'Type of action')
         string(name: 'X_HOST', defaultValue: '', description: 'Hostname of the Proxmox server')
         string(name: 'X_FORMATTED_TIMESTAMP', defaultValue: '', description: 'Backup timestamp')
@@ -39,7 +45,6 @@ pipeline {
                         error "Logs are empty or have not been received."
                     }
 
-                    // Creating the log file in the local workspace. (It will be removed at the end of the job).
                     // The type comes from the webhook body: only keep safe characters.
                     def safeType = (params.X_TYPE ?: '').replaceAll('[^A-Za-z0-9_-]', '') ?: 'action'
                     def logFileName = "${safeType}-log-${env.X_BACKUP_TIMESTAMP}.log"
@@ -52,21 +57,25 @@ pipeline {
         stage('Upload to Nextcloud') {
             steps {
                 script {
-
                     echo "Uploading logs to Nextcloud"
-                    if (!params.X_FQDN || !params.X_USER || !params.X_PASSWORD) {
-                        error "Nextcloud parameters (FQDN, username, password) are not defined."
+                    withCredentials([usernamePassword(credentialsId: env.NEXTCLOUD_CREDENTIALS,
+                                                      usernameVariable: 'NC_USER', passwordVariable: 'NC_PASS')]) {
+                        def base = env.NEXTCLOUD_URL.replaceAll('/+$', '')
+                        def nextcloudURL = "${base}/remote.php/dav/files/${urlEncode(env.NC_USER)}/${davPath(env.NEXTCLOUD_FOLDER)}/${env.LOG_FILE}"
+
+                        // Values go through the environment and are never interpolated into the script.
+                        // The credentials are given to curl on stdin, so they do not show in the process list.
+                        withEnv(["NC_URL=${nextcloudURL}"]) {
+                            sh '''
+                                set -eu
+                                esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
+                                printf 'user = "%s:%s"\\n' "$(esc "$NC_USER")" "$(esc "$NC_PASS")" |
+                                    curl --config - -T "./$LOG_FILE" "$NC_URL"
+                            '''
+                        }
+                        env.PROTECTED_URL = nextcloudURL
                     }
-
-                    def nextcloudURL = "https://${params.X_FQDN}/remote.php/dav/files/${params.X_USER}/BACKUP-LOGS/${env.LOG_FILE}"
-
-                    // Values go through the environment and are never interpolated into the script.
-                    withEnv(["NC_USER=${params.X_USER}", "NC_PASS=${params.X_PASSWORD}", "NC_URL=${nextcloudURL}"]) {
-                        sh 'curl -u "$NC_USER:$NC_PASS" -T "./$LOG_FILE" "$NC_URL"'
-                    }
-
-                    env.PROTECTED_URL = nextcloudURL
-                    echo "File uploaded successfully: ${env.PROTECTED_URL}"
+                    echo "File uploaded successfully: ${env.LOG_FILE}"
                 }
             }
         }
@@ -74,9 +83,6 @@ pipeline {
             steps {
                 script {
                     echo "Sending link to Discord"
-                    if (!params.X_DISCORD_WEBHOOK) {
-                        error "Discord webhook is not defined."
-                    }
 
                     // Not sure about the usage of the two next switch/case.
                     // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.
@@ -133,10 +139,14 @@ pipeline {
                         content: "${stateMessage} ${logMessage}"
                     ])
 
-                    echo "Message for Discord: ${discordMessage}"
                     writeFile file: 'discord-payload.json', text: discordMessage
-                    withEnv(["DISCORD_WEBHOOK=${params.X_DISCORD_WEBHOOK}"]) {
-                        sh 'curl -H "Content-Type: application/json" -X POST --data-binary @discord-payload.json "$DISCORD_WEBHOOK"'
+                    withCredentials([string(credentialsId: env.DISCORD_CREDENTIALS, variable: 'DISCORD_WEBHOOK')]) {
+                        sh '''
+                            set -eu
+                            esc() { printf '%s' "$1" | sed 's/[\\\\"]/\\\\&/g'; }
+                            printf 'url = "%s"\\n' "$(esc "$DISCORD_WEBHOOK")" |
+                                curl --config - -H "Content-Type: application/json" --data-binary @discord-payload.json
+                        '''
                     }
                     echo "Message successfully sent to Discord."
                 }
@@ -149,4 +159,16 @@ pipeline {
             cleanWs()
         }
     }
+}
+
+// Encodes one segment of a URL path.
+@NonCPS
+String urlEncode(String value) {
+    return URLEncoder.encode(value, 'UTF-8').replace('+', '%20')
+}
+
+// Encodes a folder path ("a/b c" -> "a/b%20c"), ignoring empty segments.
+@NonCPS
+String davPath(String folder) {
+    return folder.split('/').findAll { it }.collect { urlEncode(it) }.join('/')
 }
