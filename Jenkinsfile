@@ -50,20 +50,20 @@ pipeline {
         stage('Upload to Nextcloud') {
             steps {
                 script {
-                    
+
                     echo "Uploading logs to Nextcloud"
                     if (!params.X_FQDN || !params.X_USER || !params.X_PASSWORD) {
                         error "Nextcloud parameters (FQDN, username, password) are not defined."
                     }
-                    
+
                     def nextcloudURL = "https://${params.X_FQDN}/remote.php/dav/files/${params.X_USER}/BACKUP-LOGS/${env.LOG_FILE}"
-                  
+
                     // This works, but it lacks the option to hide the user and password in the Jenkins job logs.
                     // It might also need some retries in case the Nextcloud server is unavailable for a few seconds/minutes/hours/etc.
                     sh """
                     curl -u ${params.X_USER}:${params.X_PASSWORD} -T ./${env.LOG_FILE} ${nextcloudURL}
                     """
-                    
+
                     env.PROTECTED_URL = nextcloudURL
                     echo "File uploaded successfully: ${env.PROTECTED_URL}"
                 }
@@ -76,9 +76,9 @@ pipeline {
                     if (!params.X_DISCORD_WEBHOOK) {
                         error "Discord webhook is not defined."
                     }
-                  
+
                     // Not sure about the usage of the two next switch/case.
-                    // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.  
+                    // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.
                     def actionType = ""
                     switch(params.X_TYPE) {
                         case "package-updates":
@@ -101,7 +101,7 @@ pipeline {
                         break
                     }
 
-                    // Creating the first part of the Discord message, which content's different by reading the <severity> variable sent by the PVE or PBS. 
+                    // Creating the first part of the Discord message, which content's different by reading the <severity> variable sent by the PVE or PBS.
                     switch(params.X_STATE) {
                         case "info":
                             stateMessage = "${actionType} for ${params.X_HOST} on ${env.X_FORMATTED_TIMESTAMP} was successfully completed."
