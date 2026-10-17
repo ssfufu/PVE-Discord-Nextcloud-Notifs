@@ -5,6 +5,7 @@ pipeline {
         // Settings: adjust them to your setup.
         NEXTCLOUD_URL         = 'https://cloud.example.com'  // base URL of the Nextcloud server
         NEXTCLOUD_FOLDER      = 'BACKUP-LOGS'                // folder where the logs are stored
+        NOTIFY_LANG           = 'en'                         // language of the Discord messages: 'en' or 'fr'
         // IDs of the Jenkins credentials (Manage Jenkins > Credentials).
         NEXTCLOUD_CREDENTIALS = 'nextcloud-backup-logs'      // "Username with password" (use an app password)
         DISCORD_CREDENTIALS   = 'discord-webhook'            // "Secret text" containing the webhook URL
@@ -120,7 +121,7 @@ pipeline {
         stage('Notify Discord') {
             steps {
                 script {
-                    def payload = discordPayload(state: env.NOTIF_STATE, type: env.NOTIF_TYPE, host: env.NOTIF_HOST,
+                    def payload = discordPayload(lang: env.NOTIFY_LANG, state: env.NOTIF_STATE, type: env.NOTIF_TYPE, host: env.NOTIF_HOST,
                                                  title: env.NOTIF_TITLE, date: env.NOTIF_ISO_DATE,
                                                  logFile: env.LOG_FILE, logUrl: env.LOG_URL)
                     writeFile file: 'discord-payload.json', text: payload
@@ -148,10 +149,11 @@ pipeline {
     }
 }
 
-// Labels used in the Discord message.
+// Labels used in the Discord message, per language.
 @NonCPS
-Map texts() {
-    return [
+Map texts(String lang) {
+    def all = [:]
+    all.en = [
         types: [
             'vzdump': 'Backup',
             'package-updates': 'Package updates',
@@ -177,13 +179,40 @@ Map texts() {
         status: 'Status',
         log: 'Log file',
     ]
+    all.fr = [
+        types: [
+            'vzdump': 'Sauvegarde',
+            'package-updates': 'Mise à jour des paquets',
+            'replication': 'Réplication',
+            'fencing': 'Fencing',
+            'system-mail': 'Mail système',
+            'gc': 'Garbage collection',
+            'prune': 'Nettoyage',
+            'sync': 'Synchronisation',
+            'verify': 'Vérification',
+            'verification': 'Vérification',
+            'tape-backup': 'Sauvegarde sur bande',
+            'tape-load': 'Chargement de bande',
+            'acme': 'Renouvellement de certificat',
+        ],
+        states: [
+            info: 'Succès',
+            notice: 'Terminé avec des remarques',
+            warning: 'Terminé avec des avertissements',
+            error: 'Échec',
+            unknown: 'Inconnu',
+        ],
+        status: 'Statut',
+        log: 'Fichier de log',
+    ]
+    return all[lang] ?: all.en
 }
 
 // Builds the Discord message: one embed, colored by severity.
 // Mentions are disabled, so a value such as "@everyone" cannot ping anybody.
 @NonCPS
 String discordPayload(Map n) {
-    def t = texts()
+    def t = texts(n.lang)
     def styles = [
         info: ['\u2705', 0x2ECC71],
         notice: ['\u2139\uFE0F', 0x3498DB],
