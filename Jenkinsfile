@@ -18,6 +18,24 @@ pipeline {
         string(name: 'X_FORMATTED_TIMESTAMP', defaultValue: '', description: 'Backup timestamp')
     }
 
+    // Generic Webhook Trigger: Proxmox calls /generic-webhook-trigger/invoke with the token
+    // stored in the "proxmox-webhook-token" credential ("Secret text").
+    // The body is never printed: it contains the full log.
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'X_STATE', value: '$.X_STATE', regexpFilter: '[^a-z]'],
+                [key: 'X_TYPE', value: '$.X_TYPE', regexpFilter: '[^a-z0-9-]'],
+                [key: 'X_HOST', value: '$.X_HOST', regexpFilter: '[^A-Za-z0-9._-]'],
+                [key: 'X_LOG_CONTENT', value: '$.X_LOG_CONTENT'],
+            ],
+            tokenCredentialId: 'proxmox-webhook-token',
+            causeString: 'Proxmox notification: $X_TYPE ($X_STATE) from $X_HOST',
+            printContributedVariables: false,
+            printPostContent: false
+        )
+    }
+
     stages {
         stage('Initialization') {
             steps {
