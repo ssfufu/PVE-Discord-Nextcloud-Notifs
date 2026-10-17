@@ -40,7 +40,9 @@ pipeline {
                     }
 
                     // Creating the log file in the local workspace. (It will be removed at the end of the job).
-                    def logFileName = "${params.X_TYPE}-log-${env.X_BACKUP_TIMESTAMP}.log"
+                    // The type comes from the webhook body: only keep safe characters.
+                    def safeType = (params.X_TYPE ?: '').replaceAll('[^A-Za-z0-9_-]', '') ?: 'action'
+                    def logFileName = "${safeType}-log-${env.X_BACKUP_TIMESTAMP}.log"
                     writeFile file: logFileName, text: params.X_LOG_CONTENT
                     env.LOG_FILE = logFileName
                     echo "File saved locally: ${logFileName}"
@@ -58,11 +60,10 @@ pipeline {
 
                     def nextcloudURL = "https://${params.X_FQDN}/remote.php/dav/files/${params.X_USER}/BACKUP-LOGS/${env.LOG_FILE}"
 
-                    // This works, but it lacks the option to hide the user and password in the Jenkins job logs.
-                    // It might also need some retries in case the Nextcloud server is unavailable for a few seconds/minutes/hours/etc.
-                    sh """
-                    curl -u ${params.X_USER}:${params.X_PASSWORD} -T ./${env.LOG_FILE} ${nextcloudURL}
-                    """
+                    // Values go through the environment and are never interpolated into the script.
+                    withEnv(["NC_USER=${params.X_USER}", "NC_PASS=${params.X_PASSWORD}", "NC_URL=${nextcloudURL}"]) {
+                        sh 'curl -u "$NC_USER:$NC_PASS" -T "./$LOG_FILE" "$NC_URL"'
+                    }
 
                     env.PROTECTED_URL = nextcloudURL
                     echo "File uploaded successfully: ${env.PROTECTED_URL}"
@@ -80,6 +81,7 @@ pipeline {
                     // Not sure about the usage of the two next switch/case.
                     // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.
                     def actionType = ""
+                    def stateMessage = ""
                     switch(params.X_TYPE) {
                         case "package-updates":
                             actionType = "Package updates"
@@ -132,11 +134,10 @@ pipeline {
                     ])
 
                     echo "Message for Discord: ${discordMessage}"
-                    sh """
-                    curl -H "Content-Type: application/json" -X POST \
-                    -d '${discordMessage}' \
-                    ${params.X_DISCORD_WEBHOOK}
-                    """
+                    writeFile file: 'discord-payload.json', text: discordMessage
+                    withEnv(["DISCORD_WEBHOOK=${params.X_DISCORD_WEBHOOK}"]) {
+                        sh 'curl -H "Content-Type: application/json" -X POST --data-binary @discord-payload.json "$DISCORD_WEBHOOK"'
+                    }
                     echo "Message successfully sent to Discord."
                 }
             }
