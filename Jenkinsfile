@@ -111,74 +111,19 @@ pipeline {
                                 nc --fail --output /dev/null --upload-file "$LOG_FILE" "$url/$LOG_FILE"
                             '''
                         }
-                        env.PROTECTED_URL = "${davRoot}/${folder}/${env.LOG_FILE}"
+                        env.LOG_URL = "${davRoot}/${folder}/${env.LOG_FILE}"
                     }
                     echo "File uploaded successfully: ${env.LOG_FILE}"
                 }
             }
         }
-        stage('Send link to Discord') {
+        stage('Notify Discord') {
             steps {
                 script {
-                    echo "Sending link to Discord"
-
-                    // Not sure about the usage of the two next switch/case.
-                    // The first part of the stateMessage variable, it depends on the value of <fields.type> sent by the PVE or PBS.
-                    def actionType = ""
-                    def stateMessage = ""
-                    switch(env.NOTIF_TYPE) {
-                        case "package-updates":
-                            actionType = "Package updates"
-                            break
-                        case "prune":
-                            actionType = "Pruning"
-                            break
-                        case "gc":
-                            actionType = "Garbage collection"
-                            break
-                        case "verify":
-                        case "verification":
-                            actionType = "Verification"
-                            break
-                        case "vzdump":
-                            actionType = "Backup"
-                            break
-                        default:
-                            actionType = "Action"
-                        break
-                    }
-
-                    // Creating the first part of the Discord message, which content's different by reading the <severity> variable sent by the PVE or PBS.
-                    switch(env.NOTIF_STATE) {
-                        case "info":
-                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} was successfully completed."
-                            break
-                        case "error":
-                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} failed."
-                            break
-                        case "notice":
-                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} completed with errors."
-                            break
-                        case "warning":
-                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} completed with warnings."
-                            break
-                        case "unknown":
-                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} has an unknown state: ${env.NOTIF_STATE}"
-                            break
-                        default:
-                            stateMessage = "${actionType} for ${env.NOTIF_HOST} on ${env.NOTIF_DATE} has an unrecognized state (default message): ${env.NOTIF_STATE}"
-                            break
-                    }
-
-                    // Second part of the Discord message, it contains the URL to download the log file (protected by the basic authentication module of Nextcloud).
-                    def logMessage = "The log file is available here: ${env.PROTECTED_URL}"
-
-                    // Assembly of the Discord message.
-                    def discordMessage = groovy.json.JsonOutput.toJson([
-                        content: "${stateMessage} ${logMessage}"
-                    ])
-
-                    writeFile file: 'discord-payload.json', text: discordMessage
+                    def payload = discordPayload(state: env.NOTIF_STATE, type: env.NOTIF_TYPE, host: env.NOTIF_HOST,
+                                                 title: env.NOTIF_TITLE, date: env.NOTIF_ISO_DATE,
+                                                 logFile: env.LOG_FILE, logUrl: env.LOG_URL)
+                    writeFile file: 'discord-payload.json', text: payload
                     withCredentials([string(credentialsId: env.DISCORD_CREDENTIALS, variable: 'DISCORD_WEBHOOK')]) {
                         sh '''
                             set -eu
@@ -190,7 +135,7 @@ pipeline {
                                     --header 'Content-Type: application/json' --data-binary @discord-payload.json
                         '''
                     }
-                    echo "Message successfully sent to Discord."
+                    echo "Message sent to Discord."
                 }
             }
         }
@@ -201,6 +146,67 @@ pipeline {
             cleanWs()
         }
     }
+}
+
+// Labels used in the Discord message.
+@NonCPS
+Map texts() {
+    return [
+        types: [
+            'vzdump': 'Backup',
+            'package-updates': 'Package updates',
+            'replication': 'Replication',
+            'fencing': 'Fencing',
+            'system-mail': 'System mail',
+            'gc': 'Garbage collection',
+            'prune': 'Prune',
+            'sync': 'Sync',
+            'verify': 'Verification',
+            'verification': 'Verification',
+            'tape-backup': 'Tape backup',
+            'tape-load': 'Tape load',
+            'acme': 'Certificate renewal',
+        ],
+        states: [
+            info: 'Success',
+            notice: 'Completed with notices',
+            warning: 'Completed with warnings',
+            error: 'Failure',
+            unknown: 'Unknown',
+        ],
+        status: 'Status',
+        log: 'Log file',
+    ]
+}
+
+// Builds the Discord message: one embed, colored by severity.
+// Mentions are disabled, so a value such as "@everyone" cannot ping anybody.
+@NonCPS
+String discordPayload(Map n) {
+    def t = texts()
+    def styles = [
+        info: ['\u2705', 0x2ECC71],
+        notice: ['\u2139\uFE0F', 0x3498DB],
+        warning: ['\u26A0\uFE0F', 0xE67E22],
+        error: ['\u274C', 0xE74C3C],
+    ]
+    def style = styles[n.state] ?: ['\u2754', 0x95A5A6]
+    def action = t.types[n.type] ?: n.type
+    def status = t.states[n.state] ?: "${t.states.unknown} (${n.state})"
+
+    def embed = [
+        title: truncate("${style[0]} ${n.host} \u2014 ${action}", 256),
+        color: style[1],
+        timestamp: n.date,
+        fields: [
+            [name: t.status, value: status.toString(), inline: true],
+            [name: t.log, value: "[${n.logFile}](${n.logUrl})".toString(), inline: true],
+        ],
+    ]
+    if (n.title) {
+        embed.description = n.title
+    }
+    return groovy.json.JsonOutput.toJson([allowed_mentions: [parse: []], embeds: [embed]])
 }
 
 // Encodes one segment of a URL path.
