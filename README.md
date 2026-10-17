@@ -4,7 +4,7 @@
 > full log stored in Nextcloud, through a Jenkins pipeline.
 >
 > Supported: **Proxmox VE 8.3+** and **Proxmox Backup Server 3.3+** (webhook
-> notification targets).
+> notification targets). 🇫🇷 [Version française](README.fr.md)
 
 ## 📖 Table of contents
 
